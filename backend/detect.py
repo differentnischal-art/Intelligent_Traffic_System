@@ -1,12 +1,12 @@
 from ultralytics import YOLO
 
-model = YOLO(r"C:\Projects\Intelligent_Traffic_Signal\best1.pt")
+model = YOLO(r"/best1.pt")
 
-results = model(r"C:\Projects\Intelligent_Traffic_Signal\Imgvideofortesting\traffic1.jpg" ,
+results = model(r"C:\Projects\Intelligent_Traffic_Signal\Imgvideofortesting\trafficv.mp4" ,
     save=True,
     project=r"C:\Projects\Intelligent_Traffic_Signal\output",
     name="predict",
-    conf=0.5
+    conf=0.6
 )
 for result in results:
     boxes = result.boxes

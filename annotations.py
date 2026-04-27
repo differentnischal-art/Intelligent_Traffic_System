@@ -1,6 +1,6 @@
 import os
 
-labels_dir = "ambulance_dataset/Ambulance labelling.v2i.yolov8/train/labels"
+labels_dir = "dataset/Ambulance labelling.v2i.yolov8/train/labels"
 fixed = 0
 
 for f in os.listdir(labels_dir):

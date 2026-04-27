@@ -10,7 +10,7 @@ import os
 VIDEO_SOURCE      = r"C:\Projects\Intelligent_Traffic_Signal\Imgvideofortesting\trafficv.mp4"
 VEHICLE_MODEL     = "yolov8n.pt"
 AMBULANCE_MODEL   = r"C:\Projects\Intelligent_Traffic_Signal\runs\segment\ambulance_v24\weights\best1.pt"
-OUTPUT_PATH       = r"C:\Projects\Intelligent_Traffic_Signal\output\traffic_output.mp4"
+OUTPUT_PATH       = r"/output/traffic_output.mp4"
 
 NUM_LANES         = 4
 MAX_VEHICLES      = 15

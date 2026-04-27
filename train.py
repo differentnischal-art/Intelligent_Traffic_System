@@ -3,7 +3,7 @@ from ultralytics import YOLO
 def main():
     model = YOLO("yolov8n-seg.pt")
     model.train(
-        data         = r"C:\Projects\Intelligent_Traffic_Signal\ambulance_dataset\Ambulance labelling.v2i.yolov8\data.yaml",
+        data         = r"C:\Projects\Intelligent_Traffic_Signal\dataset\Ambulance labelling.v2i.yolov8\data.yaml",
         epochs       = 100,
         imgsz        = 640,
         batch        = 16       ,
@@ -20,7 +20,7 @@ def main():
     print("\nTraining done. Running validation...")
     trained = YOLO("runs/segment/ambulance_v2/weights/best.pt")
     metrics = trained.val(
-        data         = "ambulance_dataset/Ambulance labelling.v2i.yolov8/data.yaml",
+        data         = "dataset/Ambulance labelling.v2i.yolov8/data.yaml",
         workers      = 0,
         overlap_mask = False,
         split        = "val",
