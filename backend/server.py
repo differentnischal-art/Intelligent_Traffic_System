@@ -8,6 +8,7 @@ import threading
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,6 +20,7 @@ from backend.config import (
     VEHICLE_MODEL_PATH, AMBULANCE_MODEL_PATH,
 )
 from backend.lane_worker import run_lane
+from backend.signal_controller import SmartSignalController
 
 
 # ── Global runtime objects (one instance per process) ────────────────────────
@@ -26,13 +28,18 @@ _v_model:     Optional[YOLO]       = None
 _a_model:     Optional[YOLO]       = None
 _shared_state: dict                = {}          # lane_id → state dict
 _state_lock:   threading.Lock      = threading.Lock()
+_v_model_lock: threading.Lock      = threading.Lock()
+_a_model_lock: threading.Lock      = threading.Lock()
 _stop_events:  dict                = {}          # lane_id → threading.Event
 _threads:      list                = []
+_signal_controller: Optional[SmartSignalController] = None
 
 
 def _default_lane_state() -> dict:
     return {
+        "lane_id":    "",
         "signal":     "RED",
+        "signal_state": "RED",
         "density":    0,
         "count":      0,
         "green_time": 0,
@@ -41,11 +48,33 @@ def _default_lane_state() -> dict:
         "frame":      "",
         "active":     False,
         "error":      None,
+        "active_phase": "RED",
+        "phase_duration": 0,
+        "controller_reason": "idle",
     }
 
 
+def _public_lane_state(lane_id: str, lane: dict) -> dict:
+    state = {**lane, "lane_id": lane.get("lane_id") or lane_id}
+    return {key: value for key, value in state.items() if key != "frame"}
+
+
+def _prepare_model_for_threads(model: YOLO, model_lock: threading.Lock, label: str) -> None:
+    """
+    Force Ultralytics' lazy setup to happen during startup, not inside lane
+    worker threads. A lock is still used during inference because YOLO model
+    instances mutate internal predictor state.
+    """
+    dummy = np.zeros((64, 64, 3), dtype=np.uint8)
+    with model_lock:
+        model(dummy, verbose=False)
+    print(f"{label} model ready for threaded inference.")
+
+
 def create_app() -> FastAPI:
-    UPLOAD_DIR.mkdir(exist_ok=True)
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+    STATIC_DIR.mkdir(parents=True, exist_ok=True)
 
     app = FastAPI(title="ITMS API", version="2.0")
 
@@ -58,28 +87,34 @@ def create_app() -> FastAPI:
     )
 
     # Serve static files (CSS / JS)
-    if STATIC_DIR.exists():
-        app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
     # ── Startup: load models ──────────────────────────────────────────────────
     @app.on_event("startup")
     def _load_models():
-        global _v_model, _a_model
+        global _v_model, _a_model, _a_model_lock
         print("Loading vehicle model (yolov8n.pt)...")
         _v_model = YOLO(VEHICLE_MODEL_PATH)
+        _prepare_model_for_threads(_v_model, _v_model_lock, "Vehicle")
 
         print(f"Loading ambulance model ({AMBULANCE_MODEL_PATH})...")
         amb_path = Path(AMBULANCE_MODEL_PATH)
         if amb_path.exists():
             _a_model = YOLO(str(amb_path))
+            _prepare_model_for_threads(_a_model, _a_model_lock, "Ambulance")
             print("Ambulance model loaded.")
         else:
             print(f"WARNING: {amb_path} not found — using vehicle model as fallback.")
             _a_model = _v_model
+            _a_model_lock = _v_model_lock
 
     # ── Shutdown: stop all workers ────────────────────────────────────────────
     @app.on_event("shutdown")
     def _stop_all():
+        global _signal_controller
+        if _signal_controller:
+            _signal_controller.stop()
+            _signal_controller = None
         for ev in _stop_events.values():
             ev.set()
         for t in _threads:
@@ -123,7 +158,7 @@ def create_app() -> FastAPI:
         Step 1: Tell backend how many lanes will be monitored.
         Clears any previous session and prepares fresh state.
         """
-        global _shared_state, _stop_events, _threads
+        global _shared_state, _stop_events, _threads, _signal_controller
 
         # Stop existing workers cleanly
         for ev in _stop_events.values():
@@ -132,12 +167,18 @@ def create_app() -> FastAPI:
             t.join(timeout=2)
         _threads.clear()
         _stop_events.clear()
+        if _signal_controller:
+            _signal_controller.stop()
+            _signal_controller = None
 
         with _state_lock:
             _shared_state = {
-                f"lane_{i+1}": _default_lane_state()
+                f"lane_{i+1}": {**_default_lane_state(), "lane_id": f"lane_{i+1}"}
                 for i in range(lane_count)
             }
+
+        _signal_controller = SmartSignalController(_shared_state, _state_lock)
+        _signal_controller.start()
 
         return {"status": "ready", "lane_count": lane_count}
 
@@ -151,6 +192,8 @@ def create_app() -> FastAPI:
         with _state_lock:
             if lane_id not in _shared_state:
                 raise HTTPException(400, f"Unknown lane_id '{lane_id}'. Call /api/start first.")
+        if _v_model is None or _a_model is None:
+            raise HTTPException(503, "Models are still loading. Try again shortly.")
 
         # Save uploaded file
         dest = UPLOAD_DIR / f"{lane_id}.mp4"
@@ -166,7 +209,8 @@ def create_app() -> FastAPI:
         t = threading.Thread(
             target=run_lane,
             args=(lane_id, str(dest), _v_model, _a_model,
-                  _shared_state, _state_lock, stop_ev),
+                  _shared_state, _state_lock, stop_ev,
+                  _v_model_lock, _a_model_lock),
             daemon=True,
             name=f"worker-{lane_id}",
         )
@@ -176,6 +220,36 @@ def create_app() -> FastAPI:
         return {"status": "ok", "lane_id": lane_id, "file": dest.name}
 
 
+    @app.post("/api/setup")
+    async def setup_system(
+        lane_count: int = Form(...),
+        lane_1: Optional[UploadFile] = File(None),
+        lane_2: Optional[UploadFile] = File(None),
+        lane_3: Optional[UploadFile] = File(None),
+        lane_4: Optional[UploadFile] = File(None),
+        lane_5: Optional[UploadFile] = File(None),
+        lane_6: Optional[UploadFile] = File(None),
+        lane_7: Optional[UploadFile] = File(None),
+        lane_8: Optional[UploadFile] = File(None),
+    ):
+        """
+        Backward-compatible setup endpoint for the existing setup page.
+        It prepares lane state and starts one worker per uploaded lane video.
+        """
+        files = [lane_1, lane_2, lane_3, lane_4, lane_5, lane_6, lane_7, lane_8]
+        start_system(lane_count)
+
+        uploaded = []
+        for idx in range(lane_count):
+            file = files[idx]
+            if file is None:
+                raise HTTPException(400, f"Missing video for lane_{idx + 1}")
+            result = await upload_video(f"lane_{idx + 1}", file)
+            uploaded.append(result["lane_id"])
+
+        return {"status": "ok", "lane_count": lane_count, "lanes": uploaded}
+
+
     @app.get("/api/state")
     def get_state():
         """
@@ -183,13 +257,16 @@ def create_app() -> FastAPI:
         Frontend polls this every ~400ms to update signals/counts.
         """
         with _state_lock:
+            running = any(v.get("active", False) for v in _shared_state.values())
+            lanes = {
+                k: _public_lane_state(k, v)
+                for k, v in _shared_state.items()
+            }
             return {
-                "running":    bool(_shared_state),
+                "running":    running,
                 "lane_count": len(_shared_state),
-                "lanes": {
-                    k: {kk: vv for kk, vv in v.items() if kk != "frame"}
-                    for k, v in _shared_state.items()
-                },
+                "lanes": lanes,
+                "lane_states": list(lanes.values()),
             }
 
 
@@ -201,9 +278,11 @@ def create_app() -> FastAPI:
         """
         with _state_lock:
             lane = _shared_state.get(lane_id, {})
+            frame = lane.get("frame", "")
+            active = lane.get("active", False)
         return {
-            "frame":  lane.get("frame", ""),
-            "active": lane.get("active", False),
+            "frame":  frame,
+            "active": active,
         }
 
 
@@ -213,11 +292,11 @@ def create_app() -> FastAPI:
         with _state_lock:
             lanes = dict(_shared_state)
 
-        total    = sum(v["count"]     for v in lanes.values())
-        greens   = sum(1 for v in lanes.values() if v["signal"] == "GREEN")
-        amb_cnt  = sum(1 for v in lanes.values() if v["ambulance"])
-        busiest  = max(lanes, key=lambda k: lanes[k]["count"], default="—")
-        any_amb  = any(v["ambulance"] for v in lanes.values())
+        total    = sum(v.get("count", 0) for v in lanes.values())
+        greens   = sum(1 for v in lanes.values() if v.get("signal") == "GREEN")
+        amb_cnt  = sum(1 for v in lanes.values() if v.get("ambulance"))
+        busiest  = max(lanes, key=lambda k: lanes[k].get("count", 0), default="—")
+        any_amb  = any(v.get("ambulance") for v in lanes.values())
 
         return {
             "total_vehicles": total,
@@ -225,14 +304,26 @@ def create_app() -> FastAPI:
             "ambulances":     amb_cnt,
             "busiest_lane":   busiest,
             "mode":           "AMBULANCE OVERRIDE" if any_amb else "DENSITY BASED",
+            "current_green_lane": next(
+                (lane_id for lane_id, lane in lanes.items() if lane.get("signal") == "GREEN"),
+                None,
+            ),
         }
 
 
     @app.post("/api/stop")
     def stop_system():
         """Stop all lane workers and clear state."""
+        global _signal_controller
+        if _signal_controller:
+            _signal_controller.stop()
+            _signal_controller = None
         for ev in _stop_events.values():
             ev.set()
+        for t in _threads:
+            t.join(timeout=2)
+        _stop_events.clear()
+        _threads.clear()
         with _state_lock:
             _shared_state.clear()
         return {"status": "stopped"}
@@ -250,3 +341,6 @@ def create_app() -> FastAPI:
         raise HTTPException(404, f"Lane '{lane_id}' not found")
 
     return app
+
+
+app = create_app()

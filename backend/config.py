@@ -1,7 +1,7 @@
 """
 backend/config.py
 All tunable constants in one place.
-Change AMBULANCE_MODEL_PATH to your actual best.pt path.
+Change AMBULANCE_MODEL_PATH to your actual best1.pt path.
 """
 
 from pathlib import Path
@@ -14,7 +14,7 @@ TEMPLATES_DIR = FRONTEND_DIR / "templates"
 STATIC_DIR = FRONTEND_DIR / "static"
 
 VEHICLE_MODEL_PATH = "yolov8n.pt"
-AMBULANCE_MODEL_PATH = str(BASE_DIR / "models" / "best1.pt")
+AMBULANCE_MODEL_PATH = BASE_DIR / "models" / "best1.pt"
 
 VEHICLE_CONF = 0.40
 AMBULANCE_CONF = 0.40
@@ -24,6 +24,15 @@ VEHICLE_CLASSES = {
     3: "motorcycle",
     5: "bus",
     7: "truck",
+}
+
+VEHICLE_DENSITY_WEIGHTS = {
+    "bike": 1,
+    "bicycle": 1,
+    "motorcycle": 1,
+    "car": 2,
+    "bus": 5,
+    "truck": 5,
 }
 
 MAX_VEHICLES = 15
