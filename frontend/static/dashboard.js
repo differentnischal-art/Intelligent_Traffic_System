@@ -1,8 +1,89 @@
 const dashboardGrid = document.getElementById("dashboardGrid");
+const decisionSnapshot = document.getElementById("decisionSnapshot");
+const emergencyStatus = document.getElementById("emergencyStatus");
 const laneElements = new Map();
 
 function laneLabel(laneId) {
-  return laneId.replace("_", " ").replace(/\b\w/g, (char) => char.toUpperCase());
+  return String(laneId).replace("_", " ").replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;"
+  }[char]));
+}
+
+function snapshotValue(value) {
+  return value === null || value === undefined || value === "" ? "N/A" : value;
+}
+
+function updateDecisionSnapshot(snapshot) {
+  if (!decisionSnapshot) return;
+
+  if (!snapshot) {
+    decisionSnapshot.hidden = true;
+    decisionSnapshot.textContent = "";
+    return;
+  }
+
+  const laneId = snapshot.selected_lane_id || snapshot.lane_id || "N/A";
+  const density = snapshot.decision_density ?? snapshot.stable_density;
+  const greenTime = snapshot.assigned_green_time_seconds ?? snapshot.assigned_green_time;
+
+  decisionSnapshot.hidden = false;
+  decisionSnapshot.innerHTML = `
+    <span class="snapshot-title">Decision Snapshot</span>
+    <span>Lane: ${escapeHtml(laneLabel(laneId))}</span>
+    <span>Decision Density: ${escapeHtml(snapshotValue(density))}</span>
+    <span>Weighted: ${escapeHtml(snapshotValue(snapshot.weighted_density))}</span>
+    <span>Green: ${escapeHtml(snapshotValue(greenTime))}s</span>
+    <span>Reason: ${escapeHtml(snapshotValue(snapshot.decision_reason))}</span>
+    <span>Time: ${escapeHtml(snapshotValue(snapshot.decision_timestamp))}</span>
+  `;
+}
+
+function updateEmergencyStatus(status) {
+  if (!emergencyStatus) return;
+
+  if (!status || !status.active) {
+    emergencyStatus.hidden = true;
+    emergencyStatus.textContent = "";
+    return;
+  }
+
+  const lane = status.lane_id ? laneLabel(status.lane_id) : "Pending";
+  const remaining = Number(status.remaining_seconds || 0);
+  const suffix = remaining > 0 ? ` | ${remaining}s` : "";
+
+  emergencyStatus.hidden = false;
+  emergencyStatus.innerHTML = `
+    <span class="emergency-title">Emergency</span>
+    <span>${escapeHtml(status.message || "Emergency Vehicle Detected")}</span>
+    <span>Lane: ${escapeHtml(lane)}${escapeHtml(suffix)}</span>
+  `;
+}
+
+function shouldShowEmergencyTransitionWarning(laneId, lane, emergencyStatus) {
+  const emergencyLaneId = emergencyStatus?.lane_id || lane.emergency_lane_id;
+  const emergencyState = emergencyStatus?.state || lane.emergency_state;
+  const signal = String(lane.signal || "RED").toUpperCase();
+
+  return (
+    signal === "GREEN" &&
+    emergencyState === "EMERGENCY_CLEARANCE_MODE" &&
+    Boolean(emergencyLaneId) &&
+    emergencyLaneId !== laneId
+  );
+}
+
+function updateEmergencyTransitionWarning(refs, laneId, lane, emergencyStatus) {
+  const showWarning = shouldShowEmergencyTransitionWarning(laneId, lane, emergencyStatus);
+  refs.emergencyWarning.hidden = !showWarning;
+  refs.panel.classList.toggle("emergency-transition", showWarning);
 }
 
 function createSignalLight(color) {
@@ -48,7 +129,16 @@ function createLanePanel(laneId) {
   const meta = document.createElement("div");
   meta.className = "feed-meta";
 
-  feedPanel.append(image, placeholder, title, meta);
+  const emergencyWarning = document.createElement("div");
+  emergencyWarning.className = "lane-emergency-warning";
+  emergencyWarning.setAttribute("aria-live", "polite");
+  emergencyWarning.hidden = true;
+  emergencyWarning.innerHTML = `
+    <span>Ambulance Priority Incoming</span>
+    <span>Preparing Safe Transition...</span>
+  `;
+
+  feedPanel.append(image, placeholder, title, emergencyWarning, meta);
   panel.append(signalColumn, feedPanel);
   dashboardGrid.appendChild(panel);
 
@@ -56,6 +146,7 @@ function createLanePanel(laneId) {
     panel,
     image,
     placeholder,
+    emergencyWarning,
     meta,
     lights: { RED: red, YELLOW: yellow, GREEN: green }
   };
@@ -108,6 +199,9 @@ async function updateState() {
 
     const state = await response.json();
     const lanes = state.lanes || {};
+    const laneSnapshot = Object.values(lanes).find((lane) => lane.decision_snapshot)?.decision_snapshot;
+    updateEmergencyStatus(state.emergency_status);
+    updateDecisionSnapshot(state.decision_snapshot || laneSnapshot);
     renderLanes(lanes);
 
     Object.entries(lanes).forEach(([laneId, lane]) => {
@@ -115,6 +209,7 @@ async function updateState() {
       if (!refs) return;
       updateSignal(refs, lane.signal);
       updateMeta(refs, lane);
+      updateEmergencyTransitionWarning(refs, laneId, lane, state.emergency_status);
       refs.panel.classList.toggle("ambulance-active", Boolean(lane.ambulance));
     });
   } catch (error) {

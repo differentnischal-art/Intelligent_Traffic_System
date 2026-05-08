@@ -1,10 +1,19 @@
 import threading
 import unittest
 
-from backend.config import VEHICLE_DENSITY_WEIGHTS
+from backend.ambulance_confirmation import (
+    CONFIRMED_AMBULANCE,
+    POSSIBLE_AMBULANCE,
+    AmbulanceConfirmationTracker,
+)
+from backend.config import AMBULANCE_CONF, VEHICLE_DENSITY_WEIGHTS
 from backend.decision_engine import LaneSnapshot, TrafficDecisionEngine, dynamic_green_time
+from backend.detector import detect_ambulance
 from backend.signal_controller import (
     AMBULANCE_MIN_GREEN_SECONDS,
+    AMBULANCE_PRIORITY_ACTIVE,
+    EMERGENCY_CLEARANCE_MODE,
+    EMERGENCY_CLEARANCE_SECONDS,
     GREEN,
     RED,
     YELLOW,
@@ -24,7 +33,37 @@ def lane_state(density=0, ambulance=False, active=True):
         "signal_state": RED,
         "timer": 0,
         "green_time": 0,
+        "decision_snapshot": None,
     }
+
+
+class _FakeScalar:
+    def __init__(self, value):
+        self.value = value
+
+    def item(self):
+        return self.value
+
+
+class _FakeBox:
+    def __init__(self, cls_id, confidence):
+        self.cls = _FakeScalar(cls_id)
+        self.conf = _FakeScalar(confidence)
+        self.xyxy = [_FakeXyxy([1, 2, 30, 40])]
+
+
+class _FakeXyxy:
+    def __init__(self, values):
+        self.values = values
+
+    def tolist(self):
+        return self.values
+
+
+class _FakePrediction:
+    def __init__(self, boxes):
+        self.boxes = boxes
+        self.names = {0: "car", 1: "ambulance"}
 
 
 class DecisionEngineTests(unittest.TestCase):
@@ -61,6 +100,21 @@ class DecisionEngineTests(unittest.TestCase):
 
         self.assertEqual(snapshot.density, 5)
 
+    def test_lane_snapshot_ignores_possible_ambulance_state(self):
+        snapshot = LaneSnapshot.from_state(
+            "lane_1",
+            {
+                "density": 12,
+                "ambulance": True,
+                "ambulance_seen": True,
+                "ambulance_stable": False,
+                "ambulance_state": POSSIBLE_AMBULANCE,
+                "active": True,
+            },
+        )
+
+        self.assertFalse(snapshot.ambulance)
+
     def test_ambulance_priority_beats_density(self):
         engine = TrafficDecisionEngine()
         decision = engine.choose_next(
@@ -74,6 +128,59 @@ class DecisionEngineTests(unittest.TestCase):
         self.assertEqual(decision.lane_id, "lane_2")
         self.assertTrue(decision.ambulance_priority)
         self.assertEqual(decision.green_seconds, AMBULANCE_MIN_GREEN_SECONDS)
+
+
+class AmbulanceConfirmationTests(unittest.TestCase):
+    def test_detector_filters_low_confidence_and_non_ambulance_classes(self):
+        low_confidence = max(0.0, AMBULANCE_CONF - 0.01)
+        high_confidence = max(AMBULANCE_CONF, 0.95)
+
+        seen, detections = detect_ambulance([
+            _FakePrediction([
+                _FakeBox(0, 0.99),
+                _FakeBox(1, low_confidence),
+                _FakeBox(1, high_confidence),
+            ])
+        ])
+
+        self.assertTrue(seen)
+        self.assertEqual(len(detections), 1)
+        self.assertEqual(detections[0]["label"], "ambulance")
+
+    def test_single_frame_detection_stays_possible_only(self):
+        tracker = AmbulanceConfirmationTracker(
+            fps=10,
+            detection_interval=1,
+            confirmation_seconds=1.0,
+            confirmation_ratio=0.70,
+            min_hits=3,
+        )
+
+        state = tracker.update(True, [{"conf": 0.95}])
+        self.assertEqual(state.state, POSSIBLE_AMBULANCE)
+        self.assertFalse(state.confirmed)
+
+        for _ in range(tracker.required_samples):
+            state = tracker.update(False, [])
+
+        self.assertFalse(state.confirmed)
+
+    def test_majority_window_confirms_persistent_detection(self):
+        tracker = AmbulanceConfirmationTracker(
+            fps=6,
+            detection_interval=1,
+            confirmation_seconds=1.0,
+            confirmation_ratio=0.70,
+            min_hits=3,
+        )
+
+        state = None
+        for detected in [True, True, True, False, True, True]:
+            detections = [{"conf": 0.88}] if detected else []
+            state = tracker.update(detected, detections)
+
+        self.assertEqual(state.state, CONFIRMED_AMBULANCE)
+        self.assertTrue(state.confirmed)
 
 
 class SmartSignalControllerTests(unittest.TestCase):
@@ -115,6 +222,82 @@ class SmartSignalControllerTests(unittest.TestCase):
 
         self.assertEqual(self.state["lane_2"]["signal"], GREEN)
         self.assertEqual(self.state["lane_1"]["signal"], RED)
+
+    def test_possible_ambulance_does_not_preempt_active_green(self):
+        now = 155.0
+        self.controller.step(now)
+        self.assertEqual(self.state["lane_2"]["signal"], GREEN)
+
+        self.state["lane_3"]["ambulance"] = True
+        self.state["lane_3"]["ambulance_seen"] = True
+        self.state["lane_3"]["ambulance_stable"] = False
+        self.state["lane_3"]["ambulance_state"] = POSSIBLE_AMBULANCE
+        self.controller.step(now + 1)
+
+        self.assertEqual(self.state["lane_2"]["signal"], GREEN)
+        self.assertEqual(self.state["lane_3"]["signal"], RED)
+
+        self.state["lane_3"]["ambulance_stable"] = True
+        self.state["lane_3"]["ambulance_state"] = CONFIRMED_AMBULANCE
+        self.controller.step(now + 2)
+
+        self.assertEqual(self.state["lane_2"]["signal"], GREEN)
+        self.assertEqual(self.state["lane_2"]["controller_reason"], "emergency_clearance")
+        self.assertEqual(self.state["lane_2"]["timer"], EMERGENCY_CLEARANCE_SECONDS)
+        self.assertEqual(self.state["lane_2"]["emergency_state"], EMERGENCY_CLEARANCE_MODE)
+        self.assertEqual(self.state["lane_3"]["signal"], RED)
+
+        self.controller.step(now + 2 + EMERGENCY_CLEARANCE_SECONDS)
+        self.assertEqual(self.state["lane_2"]["signal"], YELLOW)
+        self.assertEqual(self.state["lane_2"]["timer"], YELLOW_SECONDS)
+
+        self.controller.step(now + 2 + EMERGENCY_CLEARANCE_SECONDS + YELLOW_SECONDS)
+        self.assertEqual(self.state["lane_3"]["signal"], GREEN)
+        self.assertEqual(self.state["lane_3"]["emergency_state"], AMBULANCE_PRIORITY_ACTIVE)
+
+    def test_decision_snapshot_locks_density_for_green_and_yellow(self):
+        now = 160.0
+        duration = dynamic_green_time(22)
+        self.state["lane_2"]["stable_density"] = 22
+        self.state["lane_2"]["weighted_density"] = 22
+
+        self.controller.step(now)
+
+        snapshot = dict(self.state["lane_2"]["decision_snapshot"])
+        self.assertEqual(snapshot["selected_lane_id"], "lane_2")
+        self.assertEqual(snapshot["decision_density"], 22)
+        self.assertEqual(snapshot["weighted_density"], 22)
+        self.assertEqual(snapshot["assigned_green_time"], duration)
+        self.assertEqual(snapshot["decision_reason_code"], "highest_density")
+        self.assertEqual(snapshot["decision_reason"], "Highest Density")
+        self.assertIn("decision_timestamp", snapshot)
+
+        self.state["lane_2"]["density"] = 1
+        self.state["lane_2"]["stable_density"] = 1
+        self.state["lane_2"]["weighted_density"] = 1
+        self.controller.step(now + 1)
+
+        self.assertEqual(self.state["lane_2"]["timer"], duration - 1)
+        self.assertEqual(self.state["lane_2"]["decision_snapshot"], snapshot)
+
+        self.controller.step(now + duration)
+
+        self.assertEqual(self.state["lane_2"]["signal"], YELLOW)
+        self.assertEqual(self.state["lane_2"]["decision_snapshot"], snapshot)
+
+    def test_decision_snapshot_marks_fairness_selection(self):
+        now = 170.0
+        first_duration = dynamic_green_time(22)
+
+        self.controller.step(now)
+        self.controller.step(now + first_duration)
+        self.controller.step(now + first_duration + YELLOW_SECONDS)
+
+        snapshot = self.state["lane_3"]["decision_snapshot"]
+        self.assertEqual(self.state["lane_3"]["signal"], GREEN)
+        self.assertEqual(snapshot["selected_lane_id"], "lane_3")
+        self.assertEqual(snapshot["decision_reason_code"], "fairness")
+        self.assertEqual(snapshot["decision_reason"], "Fairness")
 
     def test_recent_lane_is_skipped_for_next_density_cycle(self):
         now = 175.0
@@ -194,22 +377,53 @@ class SmartSignalControllerTests(unittest.TestCase):
         self.state["lane_3"]["ambulance"] = True
         self.controller.step(now + 1)
 
-        self.assertEqual(self.state["lane_3"]["signal"], GREEN)
-        self.assertEqual(self.state["lane_3"]["timer"], AMBULANCE_MIN_GREEN_SECONDS)
-        self.assertEqual(self.state["lane_2"]["signal"], RED)
+        self.assertEqual(self.state["lane_2"]["signal"], GREEN)
+        self.assertEqual(self.state["lane_2"]["controller_reason"], "emergency_clearance")
+        self.assertEqual(self.state["lane_2"]["timer"], EMERGENCY_CLEARANCE_SECONDS)
+        self.assertEqual(self.state["lane_3"]["signal"], RED)
 
         self.state["lane_4"]["ambulance"] = True
         self.state["lane_4"]["density"] = 99
-        self.controller.step(now + 5)
+        self.controller.step(now + 2)
+
+        self.assertEqual(self.state["lane_2"]["signal"], GREEN)
+        self.assertEqual(self.state["lane_3"]["signal"], RED)
+        self.assertEqual(self.state["lane_4"]["signal"], RED)
+
+        self.controller.step(now + 1 + EMERGENCY_CLEARANCE_SECONDS)
+        self.assertEqual(self.state["lane_2"]["signal"], YELLOW)
+        self.assertEqual(self.state["lane_3"]["signal"], RED)
+
+        self.controller.step(now + 1 + EMERGENCY_CLEARANCE_SECONDS + YELLOW_SECONDS)
+        self.assertEqual(self.state["lane_3"]["signal"], GREEN)
+        self.assertEqual(self.state["lane_3"]["timer"], AMBULANCE_MIN_GREEN_SECONDS)
+        self.assertEqual(self.state["lane_2"]["signal"], RED)
 
         self.assertEqual(self.state["lane_3"]["signal"], GREEN)
         self.assertEqual(self.state["lane_4"]["signal"], RED)
 
         self.state["lane_3"]["ambulance"] = False
         self.state["lane_4"]["ambulance"] = False
-        self.controller.step(now + 1 + AMBULANCE_MIN_GREEN_SECONDS)
+        self.controller.step(
+            now
+            + 1
+            + EMERGENCY_CLEARANCE_SECONDS
+            + YELLOW_SECONDS
+            + AMBULANCE_MIN_GREEN_SECONDS
+        )
 
         self.assertEqual(self.state["lane_3"]["signal"], YELLOW)
+        self.assertEqual(self.state["lane_3"]["emergency_state"], AMBULANCE_PRIORITY_ACTIVE)
+
+        self.controller.step(
+            now
+            + 1
+            + EMERGENCY_CLEARANCE_SECONDS
+            + YELLOW_SECONDS
+            + AMBULANCE_MIN_GREEN_SECONDS
+            + YELLOW_SECONDS
+        )
+        self.assertNotEqual(self.state["lane_3"].get("emergency_state"), AMBULANCE_PRIORITY_ACTIVE)
 
 
 if __name__ == "__main__":

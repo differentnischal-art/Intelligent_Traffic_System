@@ -57,11 +57,19 @@ def detect_ambulance(result):
     Temporal stability is handled by lane_worker.py.
     """
     detections = []
-    boxes = getattr(result[0], "boxes", None)
+    prediction = result[0]
+    boxes = getattr(prediction, "boxes", None)
     if boxes is None or len(boxes) == 0:
         return False, detections
 
+    names = getattr(prediction, "names", {}) or {}
     for box in boxes:
+        cls_id = int(box.cls.item())
+        if names:
+            label = _class_name(names, cls_id)
+            if "ambulance" not in label:
+                continue
+
         conf = float(box.conf.item())
         if conf < AMBULANCE_CONF:
             continue
@@ -74,6 +82,15 @@ def detect_ambulance(result):
         })
 
     return bool(detections), detections
+
+
+def _class_name(names, cls_id: int) -> str:
+    try:
+        if isinstance(names, dict):
+            return str(names.get(cls_id, "")).lower()
+        return str(names[cls_id]).lower()
+    except (IndexError, KeyError, TypeError):
+        return ""
 
 
 def annotate_frame(
@@ -123,7 +140,7 @@ def annotate_frame(
         )
 
     signal_color = (45, 235, 80) if signal == "GREEN" else ((0, 220, 255) if signal == "YELLOW" else (45, 45, 235))
-    mode = "AMBULANCE PRIORITY" if ambulance_seen else "DENSITY BASED"
+    mode = "AMBULANCE PRIORITY" if ambulance_stable else "DENSITY BASED"
     pending = max(0, ambulance_required_frames - ambulance_streak) if ambulance_seen and not ambulance_stable else 0
 
     cv2.rectangle(frame, (0, 0), (w, 82), (10, 12, 18), -1)

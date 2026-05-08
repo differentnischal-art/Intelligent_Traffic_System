@@ -13,6 +13,10 @@ import time
 
 import cv2
 
+from backend.ambulance_confirmation import (
+    AmbulanceConfirmationTracker,
+    NO_AMBULANCE,
+)
 from backend.detector import (
     annotate_frame,
     count_vehicles,
@@ -21,7 +25,6 @@ from backend.detector import (
 )
 
 
-AMBULANCE_STABLE_SECONDS = 9
 MOVING_AVG_FRAMES = 10
 DETECTION_EVERY_N_FRAMES = 3
 PLAYBACK_SPEED_MULTIPLIER = 1.08
@@ -40,10 +43,22 @@ def _finish_lane(lane_id, shared_state, state_lock, stop_event, error=None):
                 "ambulance": False,
                 "ambulance_seen": False,
                 "ambulance_stable": False,
+                "ambulance_confirmed": False,
+                "ambulance_state": NO_AMBULANCE,
+                "ambulance_streak": 0,
+                "ambulance_required_frames": 0,
+                "ambulance_confidence": 0.0,
+                "ambulance_avg_confidence": 0.0,
+                "ambulance_hit_ratio": 0.0,
                 "frame": "",
                 "active": False,
                 "error": error,
                 "controller_reason": "inactive",
+                "decision_snapshot": None,
+                "emergency_state": "NORMAL_TRAFFIC",
+                "emergency_mode": False,
+                "emergency_lane_id": None,
+                "emergency_message": "",
             })
     stop_event.set()
 
@@ -116,8 +131,8 @@ def run_lane(
     fps = _video_fps(cap)
     frame_interval = 1.0 / (fps * PLAYBACK_SPEED_MULTIPLIER)
     detection_interval = max(1, DETECTION_EVERY_N_FRAMES)
-    ambulance_required_frames = max(1, int((fps / detection_interval) * AMBULANCE_STABLE_SECONDS))
-    ambulance_detected_frames = 0
+    ambulance_tracker = AmbulanceConfirmationTracker(fps, detection_interval)
+    ambulance_confirmation = ambulance_tracker.snapshot()
     density_window = deque(maxlen=MOVING_AVG_FRAMES)
     frame_index = 0
     next_frame_at = time.perf_counter()
@@ -127,6 +142,7 @@ def run_lane(
     vehicle_detections = []
     ambulance_seen = False
     ambulance_stable = False
+    ambulance_state = NO_AMBULANCE
     ambulance_detections = []
 
     try:
@@ -158,13 +174,14 @@ def run_lane(
                         density = _stable_density(density_window)
 
                     if ambulance_result is not None:
-                        ambulance_seen, ambulance_detections = detect_ambulance(ambulance_result)
-                        if ambulance_seen:
-                            ambulance_detected_frames += 1
-                        else:
-                            ambulance_detected_frames = 0
-
-                        ambulance_stable = ambulance_detected_frames >= ambulance_required_frames
+                        raw_ambulance_seen, ambulance_detections = detect_ambulance(ambulance_result)
+                        ambulance_confirmation = ambulance_tracker.update(
+                            raw_ambulance_seen,
+                            ambulance_detections,
+                        )
+                        ambulance_seen = raw_ambulance_seen
+                        ambulance_stable = ambulance_confirmation.confirmed
+                        ambulance_state = ambulance_confirmation.state
 
                 lane_snapshot = {"signal": "RED", "green_time": 0, "timer": 0}
                 with state_lock:
@@ -176,10 +193,16 @@ def run_lane(
                             "weighted_density": density,
                             "raw_weighted_density": weighted_density,
                             "count": vehicle_count,
-                            "ambulance": ambulance_seen,
+                            "ambulance": ambulance_stable,
                             "ambulance_seen": ambulance_seen,
                             "ambulance_stable": ambulance_stable,
-                            "ambulance_streak": ambulance_detected_frames,
+                            "ambulance_confirmed": ambulance_stable,
+                            "ambulance_state": ambulance_state,
+                            "ambulance_streak": ambulance_confirmation.hit_count,
+                            "ambulance_required_frames": ambulance_confirmation.required_samples,
+                            "ambulance_confidence": ambulance_confirmation.latest_confidence,
+                            "ambulance_avg_confidence": ambulance_confirmation.avg_confidence,
+                            "ambulance_hit_ratio": ambulance_confirmation.hit_ratio,
                             "active": True,
                             "error": None,
                         })
@@ -198,8 +221,8 @@ def run_lane(
                     timer=remaining,
                     ambulance_stable=ambulance_stable,
                     ambulance_seen=ambulance_seen,
-                    ambulance_streak=ambulance_detected_frames,
-                    ambulance_required_frames=ambulance_required_frames,
+                    ambulance_streak=ambulance_confirmation.hit_count,
+                    ambulance_required_frames=ambulance_confirmation.required_samples,
                 )
                 encoded_frame = encode_frame(annotated)
 

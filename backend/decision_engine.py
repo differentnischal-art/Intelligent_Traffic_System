@@ -15,6 +15,7 @@ GREEN = "GREEN"
 
 YELLOW_SECONDS = 3
 AMBULANCE_MIN_GREEN_SECONDS = 10
+EMERGENCY_CLEARANCE_SECONDS = 4
 CONTROL_TICK_SECONDS = 0.2
 
 MIN_GREEN_SECONDS = 10
@@ -29,14 +30,22 @@ class LaneSnapshot:
     density: float
     ambulance: bool
     active: bool = True
+    weighted_density: Optional[float] = None
 
     @classmethod
     def from_state(cls, lane_id: str, state: dict) -> "LaneSnapshot":
+        density = _safe_density(state.get("stable_density", state.get("density", 0)))
+        ambulance = bool(state.get("ambulance", False))
+        if state.get("ambulance_state") is not None:
+            ambulance = state.get("ambulance_state") == "CONFIRMED_AMBULANCE"
+        elif state.get("ambulance_stable") is not None:
+            ambulance = bool(state.get("ambulance_stable", False))
         return cls(
             lane_id=lane_id,
-            density=_safe_density(state.get("stable_density", state.get("density", 0))),
-            ambulance=bool(state.get("ambulance", False)),
+            density=density,
+            ambulance=ambulance,
             active=bool(state.get("active", False)),
+            weighted_density=_safe_density(state.get("weighted_density", density)),
         )
 
 
@@ -47,6 +56,8 @@ class SignalDecision:
     reason: str
     density: float
     ambulance_priority: bool = False
+    weighted_density: Optional[float] = None
+    selection_reason: Optional[str] = None
 
 
 def dynamic_green_time(density: float) -> int:
@@ -93,16 +104,21 @@ class TrafficDecisionEngine:
                 reason="ambulance_priority",
                 density=chosen.density,
                 ambulance_priority=True,
+                weighted_density=chosen.weighted_density,
+                selection_reason="ambulance_priority",
             )
 
         density_candidates = self._apply_fair_rotation(active_lanes)
         density_candidates = self._apply_density_cooldown(density_candidates)
         chosen = max(density_candidates, key=lambda lane: self._priority_key(lane, now))
+        selection_reason = self._density_selection_reason(active_lanes, chosen, now)
         return SignalDecision(
             lane_id=chosen.lane_id,
             green_seconds=dynamic_green_time(chosen.density),
             reason="highest_density",
             density=chosen.density,
+            weighted_density=chosen.weighted_density,
+            selection_reason=selection_reason,
         )
 
     def mark_served(self, lane_id: str, now: float) -> None:
@@ -146,6 +162,17 @@ class TrafficDecisionEngine:
         last_served = self._last_served_at.get(lane.lane_id)
         waited_seconds = 1_000_000_000.0 if last_served is None else max(0.0, now - last_served)
         return (lane.density, waited_seconds, -_lane_number(lane.lane_id))
+
+    def _density_selection_reason(
+        self,
+        active_lanes: list[LaneSnapshot],
+        chosen: LaneSnapshot,
+        now: float,
+    ) -> str:
+        highest_density_lane = max(active_lanes, key=lambda lane: self._priority_key(lane, now))
+        if highest_density_lane.lane_id == chosen.lane_id:
+            return "highest_density"
+        return "fairness"
 
 
 def _clamp_seconds(value: float, minimum: int, maximum: int) -> int:

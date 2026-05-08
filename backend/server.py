@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from ultralytics import YOLO
 
+from backend.ambulance_confirmation import NO_AMBULANCE
 from backend.config import (
     UPLOAD_DIR, TEMPLATES_DIR, STATIC_DIR,
     VEHICLE_MODEL_PATH, AMBULANCE_MODEL_PATH,
@@ -45,18 +46,42 @@ def _default_lane_state() -> dict:
         "green_time": 0,
         "timer":      0,
         "ambulance":  False,
+        "ambulance_seen": False,
+        "ambulance_stable": False,
+        "ambulance_confirmed": False,
+        "ambulance_state": NO_AMBULANCE,
+        "ambulance_streak": 0,
+        "ambulance_required_frames": 0,
+        "ambulance_confidence": 0.0,
+        "ambulance_avg_confidence": 0.0,
+        "ambulance_hit_ratio": 0.0,
         "frame":      "",
         "active":     False,
         "error":      None,
         "active_phase": "RED",
         "phase_duration": 0,
         "controller_reason": "idle",
+        "decision_snapshot": None,
+        "emergency_state": "NORMAL_TRAFFIC",
+        "emergency_mode": False,
+        "emergency_lane_id": None,
+        "emergency_message": "",
     }
 
 
 def _public_lane_state(lane_id: str, lane: dict) -> dict:
     state = {**lane, "lane_id": lane.get("lane_id") or lane_id}
     return {key: value for key, value in state.items() if key != "frame"}
+
+
+def _default_emergency_status() -> dict:
+    return {
+        "state": "NORMAL_TRAFFIC",
+        "active": False,
+        "lane_id": None,
+        "message": "",
+        "remaining_seconds": 0,
+    }
 
 
 def _prepare_model_for_threads(model: YOLO, model_lock: threading.Lock, label: str) -> None:
@@ -262,11 +287,23 @@ def create_app() -> FastAPI:
                 k: _public_lane_state(k, v)
                 for k, v in _shared_state.items()
             }
+            decision_snapshot = (
+                _signal_controller.current_decision_snapshot()
+                if _signal_controller
+                else None
+            )
+            emergency_status = (
+                _signal_controller.current_emergency_status()
+                if _signal_controller
+                else _default_emergency_status()
+            )
             return {
                 "running":    running,
                 "lane_count": len(_shared_state),
                 "lanes": lanes,
                 "lane_states": list(lanes.values()),
+                "decision_snapshot": decision_snapshot,
+                "emergency_status": emergency_status,
             }
 
 
@@ -291,23 +328,44 @@ def create_app() -> FastAPI:
         """Aggregated summary across all lanes — total vehicles, mode, etc."""
         with _state_lock:
             lanes = dict(_shared_state)
+            decision_snapshot = (
+                _signal_controller.current_decision_snapshot()
+                if _signal_controller
+                else None
+            )
+            emergency_status = (
+                _signal_controller.current_emergency_status()
+                if _signal_controller
+                else _default_emergency_status()
+            )
 
         total    = sum(v.get("count", 0) for v in lanes.values())
         greens   = sum(1 for v in lanes.values() if v.get("signal") == "GREEN")
         amb_cnt  = sum(1 for v in lanes.values() if v.get("ambulance"))
         busiest  = max(lanes, key=lambda k: lanes[k].get("count", 0), default="—")
         any_amb  = any(v.get("ambulance") for v in lanes.values())
+        emergency_state = emergency_status.get("state")
 
         return {
             "total_vehicles": total,
             "green_lanes":    greens,
             "ambulances":     amb_cnt,
             "busiest_lane":   busiest,
-            "mode":           "AMBULANCE OVERRIDE" if any_amb else "DENSITY BASED",
+            "mode":           (
+                "EMERGENCY CLEARANCE"
+                if emergency_state == "EMERGENCY_CLEARANCE_MODE"
+                else (
+                    "AMBULANCE OVERRIDE"
+                    if emergency_state == "AMBULANCE_PRIORITY_ACTIVE" or any_amb
+                    else "DENSITY BASED"
+                )
+            ),
             "current_green_lane": next(
                 (lane_id for lane_id, lane in lanes.items() if lane.get("signal") == "GREEN"),
                 None,
             ),
+            "decision_snapshot": decision_snapshot,
+            "emergency_status": emergency_status,
         }
 
 
