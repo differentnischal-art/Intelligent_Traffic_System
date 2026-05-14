@@ -3,11 +3,14 @@ backend/server.py
 FastAPI app factory + all API routes.
 """
 
+import logging
+import os
 import shutil
 import threading
 from pathlib import Path
 from typing import Optional
 
+import cv2
 import numpy as np
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -17,11 +20,18 @@ from ultralytics import YOLO
 
 from backend.ambulance_confirmation import NO_AMBULANCE
 from backend.config import (
-    UPLOAD_DIR, TEMPLATES_DIR, STATIC_DIR,
+    IS_RENDER, UPLOAD_DIR, TEMPLATES_DIR, STATIC_DIR,
     VEHICLE_MODEL_PATH, AMBULANCE_MODEL_PATH,
 )
 from backend.lane_worker import run_lane
 from backend.signal_controller import SmartSignalController
+
+
+logging.basicConfig(
+    level=os.getenv("ITMS_LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 
 # ── Global runtime objects (one instance per process) ────────────────────────
@@ -34,6 +44,69 @@ _a_model_lock: threading.Lock      = threading.Lock()
 _stop_events:  dict                = {}          # lane_id → threading.Event
 _threads:      list                = []
 _signal_controller: Optional[SmartSignalController] = None
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _configure_runtime_limits() -> None:
+    """Keep OpenCV/PyTorch thread fan-out small for multi-lane cloud runs."""
+    cv_threads = max(1, _env_int("ITMS_OPENCV_THREADS", 1 if IS_RENDER else 2))
+    torch_threads = max(1, _env_int("ITMS_TORCH_THREADS", 1 if IS_RENDER else 2))
+    os.environ.setdefault("OMP_NUM_THREADS", str(torch_threads))
+    os.environ.setdefault("MKL_NUM_THREADS", str(torch_threads))
+
+    try:
+        cv2.setNumThreads(cv_threads)
+        logger.info("OpenCV threads set to %s", cv_threads)
+    except Exception:
+        logger.exception("Could not configure OpenCV thread count")
+
+    try:
+        import torch
+
+        torch.set_num_threads(torch_threads)
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            pass
+        logger.info("Torch threads set to %s", torch_threads)
+    except Exception:
+        logger.exception("Could not configure Torch thread count")
+
+
+def _path_size(path: Path) -> int | None:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return None
+
+
+def _safe_upload_suffix(filename: str | None) -> str:
+    suffix = Path(filename or "").suffix.lower()
+    if suffix and len(suffix) <= 12 and suffix[1:].replace(".", "").isalnum():
+        return suffix
+    return ".mp4"
+
+
+def _stop_existing_lane_worker(lane_id: str) -> None:
+    existing = _stop_events.pop(lane_id, None)
+    if existing:
+        logger.info("[%s] Stopping existing worker before replacing video", lane_id)
+        existing.set()
+
+    worker_name = f"worker-{lane_id}"
+    remaining_threads = []
+    for thread in _threads:
+        if thread.name == worker_name:
+            thread.join(timeout=2)
+        if thread.is_alive():
+            remaining_threads.append(thread)
+    _threads[:] = remaining_threads
 
 
 def _default_lane_state() -> dict:
@@ -93,10 +166,37 @@ def _prepare_model_for_threads(model: YOLO, model_lock: threading.Lock, label: s
     dummy = np.zeros((64, 64, 3), dtype=np.uint8)
     with model_lock:
         model(dummy, verbose=False)
-    print(f"{label} model ready for threaded inference.")
+    logger.info("%s model ready for threaded inference", label)
+
+
+def _load_yolo_model(model_path, label: str, model_lock: threading.Lock) -> YOLO:
+    path = Path(model_path).resolve()
+    logger.info(
+        "Loading %s model path=%s exists=%s size_bytes=%s",
+        label,
+        path,
+        path.exists(),
+        _path_size(path),
+    )
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{label} model file not found at {path}. Check GitHub tracking, .gitignore, "
+            "Git LFS, and Linux case-sensitive spelling."
+        )
+
+    try:
+        model = YOLO(str(path))
+        _prepare_model_for_threads(model, model_lock, label)
+        logger.info("%s model loaded successfully from %s", label, path)
+        return model
+    except Exception:
+        logger.exception("%s model failed to load from %s", label, path)
+        raise
 
 
 def create_app() -> FastAPI:
+    _configure_runtime_limits()
+
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
     STATIC_DIR.mkdir(parents=True, exist_ok=True)
@@ -118,18 +218,17 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     def _load_models():
         global _v_model, _a_model, _a_model_lock
-        print("Loading vehicle model (yolov8n.pt)...")
-        _v_model = YOLO(VEHICLE_MODEL_PATH)
-        _prepare_model_for_threads(_v_model, _v_model_lock, "Vehicle")
+        _v_model = _load_yolo_model(VEHICLE_MODEL_PATH, "Vehicle", _v_model_lock)
 
-        print(f"Loading ambulance model ({AMBULANCE_MODEL_PATH})...")
         amb_path = Path(AMBULANCE_MODEL_PATH)
-        if amb_path.exists():
-            _a_model = YOLO(str(amb_path))
-            _prepare_model_for_threads(_a_model, _a_model_lock, "Ambulance")
-            print("Ambulance model loaded.")
-        else:
-            print(f"WARNING: {amb_path} not found — using vehicle model as fallback.")
+        try:
+            _a_model = _load_yolo_model(amb_path, "Ambulance", _a_model_lock)
+        except FileNotFoundError as exc:
+            logger.warning("%s Using vehicle model as ambulance fallback.", exc)
+            _a_model = _v_model
+            _a_model_lock = _v_model_lock
+        except Exception:
+            logger.exception("Ambulance model failed. Using vehicle model as fallback.")
             _a_model = _v_model
             _a_model_lock = _v_model_lock
 
@@ -220,11 +319,23 @@ def create_app() -> FastAPI:
         if _v_model is None or _a_model is None:
             raise HTTPException(503, "Models are still loading. Try again shortly.")
 
-        # Save uploaded file
-        dest = UPLOAD_DIR / f"{lane_id}.mp4"
+        _stop_existing_lane_worker(lane_id)
+
+        # Save uploaded file. Preserve the container extension when possible so
+        # OpenCV/FFmpeg do not have to guess a WebM/MOV/AVI file named .mp4.
+        dest = (UPLOAD_DIR / f"{lane_id}{_safe_upload_suffix(file.filename)}").resolve()
         with open(dest, "wb") as f:
             shutil.copyfileobj(file.file, f)
-        print(f"[{lane_id}] Video saved → {dest}")
+        size = _path_size(dest) or 0
+        logger.info(
+            "[%s] Video saved path=%s original_filename=%s size_bytes=%s",
+            lane_id,
+            dest,
+            file.filename,
+            size,
+        )
+        if size <= 0:
+            raise HTTPException(400, f"Uploaded video for {lane_id} is empty.")
 
         # Create stop event for this lane
         stop_ev = threading.Event()

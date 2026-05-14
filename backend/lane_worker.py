@@ -2,12 +2,15 @@
 Lane video worker used by backend.server.
 
 Each uploaded video is treated as exactly one lane. Detection runs on the full
-frame, updates one lane state, and exits when the video ends.
+frame, updates one lane state, and loops the source until the lane is stopped.
 """
 
 from __future__ import annotations
 
 from collections import deque
+import logging
+import os
+from pathlib import Path
 import threading
 import time
 
@@ -25,11 +28,58 @@ from backend.detector import (
 )
 
 
+logger = logging.getLogger(__name__)
+
+
+def _is_render() -> bool:
+    return os.getenv("RENDER", "").lower() == "true" or bool(os.getenv("RENDER_SERVICE_ID"))
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+IS_RENDER = _is_render()
+
 MOVING_AVG_FRAMES = 10
-DETECTION_EVERY_N_FRAMES = 3
-PLAYBACK_SPEED_MULTIPLIER = 1.08
-MODEL_INFERENCE_WAIT_SECONDS = 0.04
-WORKER_ERROR_BACKOFF_SECONDS = 0.05
+DETECTION_EVERY_N_FRAMES = max(
+    1,
+    _env_int("ITMS_DETECTION_EVERY_N_FRAMES", 5 if IS_RENDER else 3),
+)
+PLAYBACK_SPEED_MULTIPLIER = max(
+    0.1,
+    _env_float("ITMS_PLAYBACK_SPEED_MULTIPLIER", 1.0 if IS_RENDER else 1.08),
+)
+MODEL_INFERENCE_WAIT_SECONDS = max(
+    0.0,
+    _env_float("ITMS_MODEL_INFERENCE_WAIT_SECONDS", 0.04),
+)
+WORKER_ERROR_BACKOFF_SECONDS = max(
+    0.01,
+    _env_float("ITMS_WORKER_ERROR_BACKOFF_SECONDS", 0.05),
+)
+CAPTURE_REOPEN_BACKOFF_SECONDS = max(
+    0.25,
+    _env_float("ITMS_CAPTURE_REOPEN_BACKOFF_SECONDS", 1.0 if IS_RENDER else 0.5),
+)
+MAX_STREAM_FPS = max(
+    0.0,
+    _env_float("ITMS_MAX_STREAM_FPS", 12.0 if IS_RENDER else 0.0),
+)
+MODEL_IMGSZ = max(
+    0,
+    _env_int("ITMS_MODEL_IMGSZ", 480 if IS_RENDER else 640),
+)
 
 
 def _finish_lane(lane_id, shared_state, state_lock, stop_event, error=None):
@@ -70,14 +120,163 @@ def _video_fps(cap):
     return fps
 
 
+def _frame_interval(cap) -> float:
+    playback_fps = _video_fps(cap) * PLAYBACK_SPEED_MULTIPLIER
+    if MAX_STREAM_FPS > 0:
+        playback_fps = min(playback_fps, MAX_STREAM_FPS)
+    return 1.0 / max(1.0, playback_fps)
+
+
+def _capture_backend_name(cap) -> str:
+    try:
+        return cap.getBackendName()
+    except Exception:
+        return "unknown"
+
+
+def _file_size(path: Path) -> int | None:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return None
+
+
+def _resolve_video_path(video_path) -> Path:
+    path = Path(video_path).expanduser()
+    if not path.is_absolute():
+        path = path.resolve()
+    return path.resolve()
+
+
+def _log_capture_details(lane_id: str, cap) -> None:
+    logger.info(
+        "[%s] VideoCapture details backend=%s fps=%.2f frames=%.0f width=%.0f height=%.0f",
+        lane_id,
+        _capture_backend_name(cap),
+        cap.get(cv2.CAP_PROP_FPS),
+        cap.get(cv2.CAP_PROP_FRAME_COUNT),
+        cap.get(cv2.CAP_PROP_FRAME_WIDTH),
+        cap.get(cv2.CAP_PROP_FRAME_HEIGHT),
+    )
+
+
+def _open_video_capture(lane_id: str, video_path):
+    path = _resolve_video_path(video_path)
+    exists = path.exists()
+    logger.info(
+        "[%s] Loading video path=%s exists=%s size_bytes=%s",
+        lane_id,
+        path,
+        exists,
+        _file_size(path),
+    )
+
+    if not exists:
+        logger.error(
+            "[%s] Video path does not exist. Check Linux case-sensitive spelling: %s",
+            lane_id,
+            path,
+        )
+        return None, path
+
+    attempts = [("default", None)]
+    if hasattr(cv2, "CAP_FFMPEG"):
+        attempts.append(("ffmpeg", cv2.CAP_FFMPEG))
+
+    for backend_name, backend in attempts:
+        cap = (
+            cv2.VideoCapture(str(path))
+            if backend is None
+            else cv2.VideoCapture(str(path), backend)
+        )
+        opened = cap.isOpened()
+        logger.info(
+            "[%s] cv2.VideoCapture backend_attempt=%s isOpened=%s backend=%s",
+            lane_id,
+            backend_name,
+            opened,
+            _capture_backend_name(cap) if opened else "unavailable",
+        )
+        if opened:
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+            _log_capture_details(lane_id, cap)
+            return cap, path
+        cap.release()
+
+    logger.error(
+        "[%s] OpenCV could not open video. This often means a missing file, bad case, "
+        "unsupported codec/container, or incomplete upload: %s",
+        lane_id,
+        path,
+    )
+    return None, path
+
+
+def _valid_frame(frame) -> bool:
+    return frame is not None and getattr(frame, "size", 0) > 0
+
+
+def _read_after_rewind(cap):
+    try:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        cap.set(cv2.CAP_PROP_POS_MSEC, 0)
+    except Exception:
+        pass
+    ok, frame = cap.read()
+    return ok and _valid_frame(frame), frame
+
+
+def _restart_capture(lane_id: str, cap, video_path, reason: str):
+    if cap is not None and cap.isOpened():
+        logger.warning(
+            "[%s] Frame read failed (%s). Restarting stream at pos=%.0f total=%.0f",
+            lane_id,
+            reason,
+            cap.get(cv2.CAP_PROP_POS_FRAMES),
+            cap.get(cv2.CAP_PROP_FRAME_COUNT),
+        )
+        ok, frame = _read_after_rewind(cap)
+        if ok:
+            logger.info("[%s] Stream restarted by rewinding to frame 0", lane_id)
+            return cap, frame, True
+
+        logger.warning("[%s] Rewind failed; releasing and reopening capture", lane_id)
+        cap.release()
+    elif cap is not None:
+        cap.release()
+
+    cap, _ = _open_video_capture(lane_id, video_path)
+    if cap is None:
+        return None, None, False
+
+    ok, frame = cap.read()
+    if ok and _valid_frame(frame):
+        logger.info("[%s] Stream restarted with a fresh VideoCapture", lane_id)
+        return cap, frame, True
+
+    logger.error("[%s] Reopened video but first frame could not be read", lane_id)
+    cap.release()
+    return None, None, False
+
+
 def _predict(model, model_lock, frame):
     if model_lock is None:
-        return model(frame, verbose=False)
+        kwargs = {"verbose": False}
+        if MODEL_IMGSZ > 0:
+            kwargs["imgsz"] = MODEL_IMGSZ
+        return model(frame, **kwargs)
+
     acquired = model_lock.acquire(timeout=MODEL_INFERENCE_WAIT_SECONDS)
     if not acquired:
         return None
     try:
-        return model(frame, verbose=False)
+        kwargs = {"verbose": False}
+        if MODEL_IMGSZ > 0:
+            kwargs["imgsz"] = MODEL_IMGSZ
+        return model(frame, **kwargs)
     finally:
         model_lock.release()
 
@@ -120,47 +319,79 @@ def run_lane(
     vehicle_model_lock: threading.Lock | None = None,
     ambulance_model_lock: threading.Lock | None = None,
 ):
-    print(f"[{lane_id}] Worker started -> {video_path}")
-    cap = cv2.VideoCapture(video_path)
-
-    if not cap.isOpened():
-        _finish_lane(lane_id, shared_state, state_lock, stop_event, "Cannot open video")
-        print(f"[{lane_id}] Cannot open video")
-        return
-
-    fps = _video_fps(cap)
-    frame_interval = 1.0 / (fps * PLAYBACK_SPEED_MULTIPLIER)
-    detection_interval = max(1, DETECTION_EVERY_N_FRAMES)
-    ambulance_tracker = AmbulanceConfirmationTracker(fps, detection_interval)
-    ambulance_confirmation = ambulance_tracker.snapshot()
-    density_window = deque(maxlen=MOVING_AVG_FRAMES)
-    frame_index = 0
-    next_frame_at = time.perf_counter()
-    vehicle_count = 0
-    weighted_density = 0
-    density = 0
-    vehicle_detections = []
-    ambulance_seen = False
-    ambulance_stable = False
-    ambulance_state = NO_AMBULANCE
-    ambulance_detections = []
+    logger.info("[%s] Worker started video_path=%s", lane_id, video_path)
+    cap = None
 
     try:
-        while not stop_event.is_set():
-            ok, frame = cap.read()
-            if not ok:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                frame_index = 0
-                ok, frame = cap.read()
-                if not ok:
-                    _finish_lane(lane_id, shared_state, state_lock, stop_event, "Cannot read video frame")
-                    print(f"[{lane_id}] Cannot read video frame")
+        while not stop_event.is_set() and cap is None:
+            cap, resolved_path = _open_video_capture(lane_id, video_path)
+            if cap is None:
+                error = f"Cannot open video: {resolved_path}"
+                _mark_lane_error(lane_id, shared_state, state_lock, error)
+                logger.error(
+                    "[%s] %s; retrying in %.2fs",
+                    lane_id,
+                    error,
+                    CAPTURE_REOPEN_BACKOFF_SECONDS,
+                )
+                if stop_event.wait(CAPTURE_REOPEN_BACKOFF_SECONDS):
                     break
 
-            if frame is None or frame.size == 0:
-                _finish_lane(lane_id, shared_state, state_lock, stop_event, "Invalid frame")
-                print(f"[{lane_id}] Invalid OpenCV frame")
-                break
+        if cap is None:
+            return
+
+        frame_interval = _frame_interval(cap)
+        detection_interval = max(1, DETECTION_EVERY_N_FRAMES)
+        ambulance_tracker = AmbulanceConfirmationTracker(_video_fps(cap), detection_interval)
+        ambulance_confirmation = ambulance_tracker.snapshot()
+        density_window = deque(maxlen=MOVING_AVG_FRAMES)
+        frame_index = 0
+        next_frame_at = time.perf_counter()
+        vehicle_count = 0
+        weighted_density = 0
+        density = 0
+        vehicle_detections = []
+        ambulance_seen = False
+        ambulance_stable = False
+        ambulance_state = NO_AMBULANCE
+        ambulance_detections = []
+
+        logger.info(
+            "[%s] Worker ready fps=%.2f detection_every=%s model_imgsz=%s max_stream_fps=%.1f",
+            lane_id,
+            _video_fps(cap),
+            detection_interval,
+            MODEL_IMGSZ,
+            MAX_STREAM_FPS,
+        )
+
+        while not stop_event.is_set():
+            if cap is None or not cap.isOpened():
+                cap, resolved_path = _open_video_capture(lane_id, video_path)
+                if cap is None:
+                    error = f"Cannot reopen video: {resolved_path}"
+                    _mark_lane_error(lane_id, shared_state, state_lock, error)
+                    if stop_event.wait(CAPTURE_REOPEN_BACKOFF_SECONDS):
+                        break
+                    continue
+                frame_interval = _frame_interval(cap)
+                next_frame_at = time.perf_counter()
+
+            ok, frame = cap.read()
+            if not ok or not _valid_frame(frame):
+                reason = "ret=false" if not ok else "empty-frame"
+                cap, frame, restarted = _restart_capture(lane_id, cap, video_path, reason)
+                frame_index = 0
+                if not restarted:
+                    error = f"Cannot read video frame; retrying ({reason})"
+                    _mark_lane_error(lane_id, shared_state, state_lock, error)
+                    if stop_event.wait(CAPTURE_REOPEN_BACKOFF_SECONDS):
+                        break
+                    continue
+
+                _mark_lane_error(lane_id, shared_state, state_lock, None)
+                frame_interval = _frame_interval(cap)
+                next_frame_at = time.perf_counter()
 
             try:
                 should_detect = frame_index % detection_interval == 0
@@ -235,7 +466,7 @@ def run_lane(
                         })
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
-                print(f"[{lane_id}] Frame processing error: {error}")
+                logger.exception("[%s] Frame processing error: %s", lane_id, error)
                 _mark_lane_error(lane_id, shared_state, state_lock, error)
                 try:
                     encoded_frame = encode_frame(frame)
@@ -246,7 +477,7 @@ def run_lane(
                                 "active": True,
                             })
                 except Exception:
-                    pass
+                    logger.exception("[%s] Failed to encode fallback frame", lane_id)
                 if stop_event.wait(WORKER_ERROR_BACKOFF_SECONDS):
                     break
 
@@ -255,6 +486,7 @@ def run_lane(
             if should_stop:
                 break
     finally:
-        cap.release()
+        if cap is not None:
+            cap.release()
         _finish_lane(lane_id, shared_state, state_lock, stop_event)
-        print(f"[{lane_id}] Worker stopped")
+        logger.info("[%s] Worker stopped", lane_id)

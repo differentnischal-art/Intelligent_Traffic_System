@@ -2,6 +2,9 @@ const dashboardGrid = document.getElementById("dashboardGrid");
 const decisionSnapshot = document.getElementById("decisionSnapshot");
 const emergencyStatus = document.getElementById("emergencyStatus");
 const laneElements = new Map();
+const STATE_POLL_MS = 250;
+const FRAME_POLL_MS = 250;
+const DEBUG_FEEDS = window.ITMS_DEBUG_FEEDS === true;
 
 function laneLabel(laneId) {
   return String(laneId).replace("_", " ").replace(/\b\w/g, (char) => char.toUpperCase());
@@ -223,10 +226,12 @@ async function updateFrame(laneId, refs) {
     if (!response.ok) return;
 
     const data = await response.json();
-    console.log(`/api/frame/${laneId}`, {
-      active: data.active,
-      frameLength: data.frame ? data.frame.length : 0
-    });
+    if (DEBUG_FEEDS) {
+      console.log(`/api/frame/${laneId}`, {
+        active: data.active,
+        frameLength: data.frame ? data.frame.length : 0
+      });
+    }
 
     if (data.frame && data.frame.length > 100) {
       refs.image.src = `data:image/jpeg;base64,${data.frame}`;
@@ -254,5 +259,5 @@ function updateFrames() {
 }
 
 updateState().then(updateFrames);
-setInterval(updateState, 150);
-setInterval(updateFrames, 150);
+setInterval(updateState, STATE_POLL_MS);
+setInterval(updateFrames, FRAME_POLL_MS);
