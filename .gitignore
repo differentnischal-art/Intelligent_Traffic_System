@@ -1,10 +1,6 @@
 # Dataset
 dataset/
 
-# Frames & temp data
-frames/
-temp/
-
 # Output files
 output/
 output.mp4
@@ -12,8 +8,7 @@ output.mp4
 # YOLO training results
 runs/
 
-# Model weights
-*.pt
+
 
 # Virtual environment
 .venv/
