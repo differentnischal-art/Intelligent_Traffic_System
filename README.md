@@ -1,3 +1,7 @@
+
+
+https://github.com/user-attachments/assets/7d8713b2-fce1-4ae4-a5bc-c4a9ba4e0398
+
 # 🚦 Intelligent Traffic Management System
 
 An AI-powered Smart Traffic Management System that dynamically controls traffic signals using real-time vehicle detection, density analysis, and emergency vehicle prioritization.
