@@ -9,6 +9,8 @@ An AI-powered Smart Traffic Management System that dynamically controls traffic 
 This project uses **Computer Vision + Deep Learning + Traffic Optimization Logic** to reduce congestion and improve emergency response efficiency.
 
 ---
+# demo: You can test the live application here: [Launch Live Demo](http://20.244.35.60:8000/)
+
 
 # 📌 Project Overview
 
